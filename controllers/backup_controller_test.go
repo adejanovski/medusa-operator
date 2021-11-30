@@ -272,3 +272,7 @@ func (c *fakeMedusaClient) CreateBackup(ctx context.Context, name string, backup
 func (c *fakeMedusaClient) GetBackups(ctx context.Context) ([]*pb.BackupSummary, error) {
 	return nil, nil
 }
+
+func (c *fakeMedusaClient) BackupStatus(ctx context.Context, name string) (*pb.BackupStatusResponse, error) {
+	return nil, nil
+}

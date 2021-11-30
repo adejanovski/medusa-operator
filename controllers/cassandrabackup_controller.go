@@ -19,11 +19,13 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/k8ssandra/medusa-operator/pkg/medusa"
+	"github.com/k8ssandra/medusa-operator/pkg/pb"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -72,8 +74,59 @@ func (r *CassandraBackupReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	backup := instance.DeepCopy()
 
+	cassdcKey := types.NamespacedName{Namespace: backup.Namespace, Name: backup.Spec.CassandraDatacenter}
+	cassdc := &cassdcapi.CassandraDatacenter{}
+	err = r.Get(ctx, cassdcKey, cassdc)
+	if err != nil {
+		r.Log.Error(err, "failed to get cassandradatacenter", "CassandraDatacenter", cassdcKey)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+	}
+
+	pods, err := r.getCassandraDatacenterPods(ctx, cassdc)
+	if err != nil {
+		r.Log.Error(err, "Failed to get datacenter pods")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+	}
+
 	// If there is anything in progress, simply requeue the request
 	if len(backup.Status.InProgress) > 0 {
+		// Check backup status
+		patch := client.MergeFrom(backup.DeepCopy())
+
+		for _, p := range pods {
+			pod := p
+			r.Log.Info("Checking backup status", "CassandraPod", pod.Name)
+			if !hasAsyncBackupStatus(ctx, backup.Spec.Name, &pod, r.ClientFactory, r.Log) {
+				// We're still on an old version of Medusa without async status checks
+				r.Log.Info("CassandraBackup is being processed already", "Backup", req.NamespacedName)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			} else {
+				r.Log.Info("Async backups are available")
+				backupStatusResp, err := backupStatus(ctx, backup.Name, &pod, r.ClientFactory)
+				if err != nil {
+					r.Log.Error(err, "Failed to get backup status", "Backup", req.NamespacedName)
+				} else {
+					if backupStatusResp.Status != pb.BackupStatusType_IN_PROGRESS {
+						backup.Status.InProgress = removeValue(backup.Status.InProgress, pod.Name)
+						if backupStatusResp.Status != pb.BackupStatusType_SUCCESS {
+							r.Log.Info("Backup success", "CassandraPod", pod.Name)
+							backup.Status.Finished = append(backup.Status.Finished, pod.Name)
+						} else {
+							r.Log.Info("Backup failed", "CassandraPod", pod.Name)
+							backup.Status.Failed = append(backup.Status.Failed, pod.Name)
+						}
+					} else {
+						r.Log.Info("Backup still running", "CassandraPod", pod.Name)
+					}
+				}
+			}
+		}
+
+		r.Log.Info("finished checking backup state")
+		if err := r.Status().Patch(context.Background(), backup, patch); err != nil {
+			r.Log.Error(err, "failed to patch status", "Backup", fmt.Sprintf("%s/%s", backup.Name, backup.Namespace))
+		}
+		// Maybe update finish time
 		r.Log.Info("CassandraBackup is being processed already", "Backup", req.NamespacedName)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
@@ -108,20 +161,6 @@ func (r *CassandraBackupReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	r.Log.Info("Backups have not been started yet")
-
-	cassdcKey := types.NamespacedName{Namespace: backup.Namespace, Name: backup.Spec.CassandraDatacenter}
-	cassdc := &cassdcapi.CassandraDatacenter{}
-	err = r.Get(ctx, cassdcKey, cassdc)
-	if err != nil {
-		r.Log.Error(err, "failed to get cassandradatacenter", "CassandraDatacenter", cassdcKey)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
-	}
-
-	pods, err := r.getCassandraDatacenterPods(ctx, cassdc)
-	if err != nil {
-		r.Log.Error(err, "Failed to get datacenter pods")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
-	}
 
 	// Make sure that Medusa is deployed
 	if !isMedusaDeployed(pods) {
@@ -162,20 +201,32 @@ func (r *CassandraBackupReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			go func() {
 				r.Log.Info("starting backup", "CassandraPod", pod.Name)
 				succeeded := false
+				stillRunning := true
 				if err := doBackup(ctx, backup.Spec.Name, backup.Spec.Type, &pod, r.ClientFactory); err == nil {
 					r.Log.Info("finished backup", "CassandraPod", pod.Name)
-					succeeded = true
+					if !hasAsyncBackupStatus(ctx, backup.Spec.Name, &pod, r.ClientFactory, r.Log) {
+						// We're still on an old version of Medusa without async status checks
+						r.Log.Info("Async backups are NOT available")
+						succeeded = true
+						stillRunning = false
+					} else {
+						r.Log.Info("Async backups are available")
+					}
 				} else {
 					r.Log.Error(err, "backup failed", "CassandraPod", pod.Name)
 				}
 				backupMutex.Lock()
 				defer backupMutex.Unlock()
 				defer wg.Done()
-				backup.Status.InProgress = removeValue(backup.Status.InProgress, pod.Name)
-				if succeeded {
-					backup.Status.Finished = append(backup.Status.Finished, pod.Name)
-				} else {
-					backup.Status.Failed = append(backup.Status.Failed, pod.Name)
+				if !stillRunning {
+					// If the backup is not running anymore, we're dealing with an old version of Medusa.
+					// We'll check again for backup status in the next reconcile loop.
+					backup.Status.InProgress = removeValue(backup.Status.InProgress, pod.Name)
+					if succeeded {
+						backup.Status.Finished = append(backup.Status.Finished, pod.Name)
+					} else {
+						backup.Status.Failed = append(backup.Status.Failed, pod.Name)
+					}
 				}
 			}()
 		}
@@ -280,6 +331,25 @@ func hasMedusaSidecar(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func hasAsyncBackupStatus(ctx context.Context, name string, pod *corev1.Pod, clientFactory medusa.ClientFactory, logger logr.Logger) bool {
+	_, err := backupStatus(ctx, name, pod, clientFactory)
+	if err != nil {
+		logger.Error(err, "failed hasAsyncBackupStatus", "Pod", pod.Name)
+		return strings.Contains(err.Error(), "NotFound")
+	}
+	return err == nil
+}
+
+func backupStatus(ctx context.Context, name string, pod *corev1.Pod, clientFactory medusa.ClientFactory) (*pb.BackupStatusResponse, error) {
+	addr := fmt.Sprintf("%s:%d", pod.Status.PodIP, backupSidecarPort)
+	if medusaClient, err := clientFactory.NewClient(addr); err != nil {
+		return nil, err
+	} else {
+		defer medusaClient.Close()
+		return medusaClient.BackupStatus(ctx, name)
+	}
 }
 
 func doBackup(ctx context.Context, name string, backupType api.BackupType, pod *corev1.Pod, clientFactory medusa.ClientFactory) error {

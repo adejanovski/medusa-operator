@@ -37,6 +37,8 @@ type Client interface {
 	CreateBackup(ctx context.Context, name string, backupType string) error
 
 	GetBackups(ctx context.Context) ([]*pb.BackupSummary, error)
+
+	BackupStatus(ctx context.Context, name string) (*pb.BackupStatusResponse, error)
 }
 
 func (c *defaultClient) Close() error {
@@ -70,4 +72,10 @@ func (c *defaultClient) DeleteBackup(ctx context.Context, name string) error {
 	request := pb.DeleteBackupRequest{Name: name}
 	_, err := c.grpcClient.DeleteBackup(context.Background(), &request)
 	return err
+}
+
+func (c *defaultClient) BackupStatus(ctx context.Context, name string) (*pb.BackupStatusResponse, error) {
+	request := pb.BackupStatusRequest{BackupName: name}
+	backupStatusResp, err := c.grpcClient.BackupStatus(context.Background(), &request)
+	return backupStatusResp, err
 }
